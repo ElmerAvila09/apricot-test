@@ -4,36 +4,114 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException, StaleElementReferenceException
 from utils.webdriver_utils import get_driver
-from config import MILENIO_SEARCH_URL, DATA_DIR
+from config import MILENIO_SEARCH_URL
 import time
 import json
 import os
 from datetime import datetime
-
+import re
 class MilenioScraperV2:
+
+
     def __init__(self):
         self.driver = get_driver()
         self.actions = ActionChains(self.driver)
+
+    def get_article_urls(self):
+        """Get all article URLs from the search results page"""
+        article_urls = []
+        try:
+            # Wait for articles to load
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "lr-list-row-row-news"))
+            )
+            
+            # Find all article links
+            articles = self.driver.find_elements(By.CSS_SELECTOR, ".lr-list-row-row-news__title a")
+            for article in articles:
+                try:
+                    url = article.get_attribute('href')
+                    if url:
+                        article_urls.append(url)
+                except Exception as e:
+                    print(f"Error getting URL: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            print(f"Error finding articles: {str(e)}")
+            
+        return article_urls
+
+    def extract_article_content(self, url):
+        """Extract all available content from an article URL"""
+        try:
+            print(f"\nProcessing article: {url}")
+            self.driver.get(url)
+            time.sleep(2)
+            
+            # Handle popups if needed
+            #self.handle_consent_popup()
+            #self.handle_notifications_popup()
+            
+            # Get article data from schema
+            page_source = self.driver.page_source
+            schema_match = re.search(r'<script type="application/ld\+json">(.*?)</script>', page_source, re.DOTALL)
+            
+            if schema_match:
+                schema_data = json.loads(schema_match.group(1))
+                
+                article_data = {
+                    "url": url,
+                    "extracted_at": datetime.now().isoformat(),
+                    "title": schema_data.get('headline', ''),
+                    "abstract": schema_data.get('description', ''),
+                    "content": schema_data.get('articleBody', ''),
+                    "author": schema_data.get('author', [{}])[0].get('name', ''),
+                    "date_published": schema_data.get('datePublished', ''),
+                    "date_modified": schema_data.get('dateModified', ''),
+                    "keywords": schema_data.get('keywords', ''),
+                    "location": schema_data.get('contentLocation', ''),
+                }
+                
+                # Try to get image data if available
+                if 'image' in schema_data:
+                    article_data['image_url'] = schema_data['image'].get('url', '')
+                    
+                return article_data
+                
+        except Exception as e:
+            print(f"Error processing article {url}: {str(e)}")
+        
+        return None
 
     def run_scraper(self, search_terms, max_pages=1):
         self.open_milenio_search()
         
         for term in search_terms:
+            all_articles = []
+            
             if self.perform_search(term):
                 print(f"\nSearch completed for term: {term}")
                 time.sleep(3)  # Wait for results to load
                 
-                # Extract articles from search results
-                articles = self.extract_articles()
+                # Get all article URLs from search results
+                article_urls = self.get_article_urls()
+                print(f"Found {len(article_urls)} articles")
+                
+                # Process each URL
+                for url in article_urls:
+                    article_data = self.extract_article_content(url)
+                    if article_data:
+                        all_articles.append(article_data)
+                    time.sleep(1)  # Small delay between articles
                 
                 # Save articles
-                if articles:
-                    self.save_articles(articles, term)
-                    print(f"Extracted {len(articles)} articles for search term: {term}")
+                if all_articles:
+                    self.save_articles(all_articles, term)
+                    print(f"Extracted and saved {len(all_articles)} articles for search term: {term}")
                 
-                # Wait for user input to continue observation
                 self.wait_for_user_input()
             else:
                 print(f"Failed to search for term: {term}")
@@ -41,6 +119,41 @@ class MilenioScraperV2:
         
         self.close_browser()
         print("Milenio search process complete.")
+
+    def save_articles(self, articles, search_term, output_dir="data"):
+        """Save articles to JSON files"""
+        # Create output directory if it doesn't exist
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Create search term specific directory
+        search_dir = os.path.join(output_dir, search_term)
+        os.makedirs(search_dir, exist_ok=True)
+        
+        for i, article in enumerate(articles, 1):
+            try:
+                # Create filename using timestamp if available
+                if article.get("date_published"):
+                    date_part = article["date_published"].split('T')[0].replace('-', '')
+                    filename = f"article_{date_part}_{i}.json"
+                else:
+                    filename = f"article_{i}.json"
+                    
+                filepath = os.path.join(search_dir, filename)
+                
+                # Save article to JSON file
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    json.dump(article, f, ensure_ascii=False, indent=2)
+                    
+            except Exception as e:
+                print(f"Error saving article {i}: {str(e)}")
+                continue
+
+
+
+
+
+
+
 
     def open_milenio_search(self):
         self.driver.get(MILENIO_SEARCH_URL)
@@ -57,80 +170,6 @@ class MilenioScraperV2:
 
         # Try to handle the notifications pop-up
         self.handle_notifications_popup()
-
-
-    def extract_articles(self):
-        """Extract articles from the current search results page"""
-        articles = []
-        try:
-            # Wait for article elements to be present
-            WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "lr-list-row-row-news"))
-            )
-            
-            # Find all article elements
-            article_elements = self.driver.find_elements(By.CLASS_NAME, "lr-list-row-row-news")
-            
-            for article in article_elements:
-                try:
-                    # Skip if this is an ad
-                    if article.get_attribute("class").find("ad-medium-rectangle-base") != -1:
-                        continue
-                    
-                    # Extract article data
-                    article_data = {
-                        "timestamp": article.find_element(By.CLASS_NAME, "lr-list-row-row-news__time").get_attribute("datetime"),
-                        "title": article.find_element(By.CLASS_NAME, "lr-list-row-row-news__title").text.strip(),
-                        "url": article.find_element(By.CSS_SELECTOR, ".lr-list-row-row-news__title a").get_attribute("href"),
-                        "abstract": article.find_element(By.CLASS_NAME, "lr-list-row-row-news__abstract").text.strip(),
-                        "extracted_at": datetime.now().isoformat()
-                    }
-                    
-                    # Try to get image info if available
-                    try:
-                        img = article.find_element(By.CLASS_NAME, "lr-list-row-row-news__img")
-                        article_data["image_url"] = img.get_attribute("src")
-                        article_data["image_alt"] = img.get_attribute("alt")
-                    except NoSuchElementException:
-                        article_data["image_url"] = None
-                        article_data["image_alt"] = None
-                    
-                    articles.append(article_data)
-                    
-                except Exception as e:
-                    print(f"Error processing article: {str(e)}")
-                    continue
-                    
-        except Exception as e:
-            print(f"Error extracting articles: {str(e)}")
-        
-        return articles
-
-    def save_articles(self, articles, search_term, output_dir="data"):
-        """Save articles to JSON files"""
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Create search term specific directory
-        search_dir = os.path.join(output_dir, search_term)
-        os.makedirs(search_dir, exist_ok=True)
-        
-        for i, article in enumerate(articles, 1):
-            # Create filename using timestamp if available, otherwise use index
-            if article.get("timestamp"):
-                date_part = article["timestamp"].split()[0].replace("-", "")
-                filename = f"article_{date_part}_{i}.json"
-            else:
-                filename = f"article_{i}.json"
-                
-            filepath = os.path.join(search_dir, filename)
-            
-            # Save article to JSON file
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(article, f, ensure_ascii=False, indent=2)
-
-
-
 
     def close_browser(self):
         self.driver.quit()
@@ -200,7 +239,8 @@ class MilenioScraperV2:
             print("Notifications pop-up handled successfully.")
             return True
         except (TimeoutException, NoSuchElementException, ElementClickInterceptedException) as e:
-            print(f"Failed to handle notifications pop-up: {str(e)}")
+            print("Error handling pop-up trying to find NO, gracias button.")
+            #print(f"Failed to handle notifications pop-up: {str(e)}")
             return False
 
     def perform_search(self, search_term):
